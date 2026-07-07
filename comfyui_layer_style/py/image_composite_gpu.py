@@ -69,50 +69,69 @@ class LS_ImageCompositeGPU:
         if flip_input:
             msk = 1.0 - msk
 
-        # ── Grow mask (GrowMaskWithBlur logic, per-frame) ─────────────────────
+        # ── Grow mask ─────────────────────────────────────────────────────────
         if expand != 0 or incremental_expandrate != 0.0:
-            growmask = msk.reshape(-1, msk.shape[-2], msk.shape[-1])
-            out = []
-            previous_output = None
-            current_expand = float(expand)
+            kernel = torch.tensor(
+                [[0, 1, 0], [1, 1, 1], [0, 1, 0]] if tapered_corners
+                else [[1, 1, 1], [1, 1, 1], [1, 1, 1]],
+                dtype=torch.float32, device=device,
+            )
+            needs_per_frame = (
+                incremental_expandrate != 0.0
+                or lerp_alpha < 1.0
+                or decay_factor < 1.0
+                or fill_holes
+            )
+            if not needs_per_frame:
+                # Fast path: all frames get identical treatment — process as one batch
+                steps = abs(round(float(expand)))
+                b4 = msk.unsqueeze(1)  # (B, 1, H, W)
+                for _ in range(steps):
+                    if expand < 0:
+                        b4 = morph.erosion(b4, kernel)
+                    else:
+                        b4 = morph.dilation(b4, kernel)
+                msk = b4.squeeze(1)
+            else:
+                # Slow path: per-frame (incremental expand or temporal lerp/decay)
+                growmask = msk.reshape(-1, msk.shape[-2], msk.shape[-1])
+                out = []
+                previous_output = None
+                current_expand = float(expand)
 
-            for m in growmask:
-                output = m.unsqueeze(0).unsqueeze(0)
-                if abs(round(current_expand)) > 0 and output.max() > 0:
-                    kernel = torch.tensor(
-                        [[0, 1, 0], [1, 1, 1], [0, 1, 0]] if tapered_corners
-                        else [[1, 1, 1], [1, 1, 1], [1, 1, 1]],
-                        dtype=torch.float32, device=device,
-                    )
-                    for _ in range(abs(round(current_expand))):
+                for m in growmask:
+                    output = m.unsqueeze(0).unsqueeze(0)
+                    steps = abs(round(current_expand))
+                    for _ in range(steps):
                         if current_expand < 0:
                             output = morph.erosion(output, kernel)
                         else:
                             output = morph.dilation(output, kernel)
 
-                output = output.squeeze(0).squeeze(0)
+                    output = output.squeeze(0).squeeze(0)
 
-                if current_expand < 0:
-                    current_expand -= abs(incremental_expandrate)
-                else:
-                    current_expand += abs(incremental_expandrate)
+                    if current_expand < 0:
+                        current_expand -= abs(incremental_expandrate)
+                    else:
+                        current_expand += abs(incremental_expandrate)
 
-                if fill_holes:
-                    import scipy.ndimage
-                    filled = scipy.ndimage.binary_fill_holes((output > 0).cpu().numpy())
-                    output = torch.from_numpy(filled.astype(np.float32)).to(device)
+                    if fill_holes:
+                        import scipy.ndimage
+                        filled = scipy.ndimage.binary_fill_holes((output > 0).cpu().numpy())
+                        output = torch.from_numpy(filled.astype(np.float32)).to(device)
 
-                if lerp_alpha < 1.0 and previous_output is not None:
-                    output = lerp_alpha * output + (1 - lerp_alpha) * previous_output
-                if decay_factor < 1.0 and previous_output is not None:
-                    output = output + decay_factor * previous_output
-                    if output.max() > 0:
-                        output = output / output.max()
+                    if lerp_alpha < 1.0 and previous_output is not None:
+                        output = lerp_alpha * output + (1 - lerp_alpha) * previous_output
+                    if decay_factor < 1.0 and previous_output is not None:
+                        output = output + decay_factor * previous_output
+                        mx = output.max()
+                        if mx > 0:
+                            output = output / mx
 
-                previous_output = output
-                out.append(output)
+                    previous_output = output
+                    out.append(output)
 
-            msk = torch.stack(out, dim=0)
+                msk = torch.stack(out, dim=0)
 
         # ── Blur mask ─────────────────────────────────────────────────────────
         if blur_radius != 0:
