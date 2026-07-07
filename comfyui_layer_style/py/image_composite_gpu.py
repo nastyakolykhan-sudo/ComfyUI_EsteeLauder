@@ -133,14 +133,16 @@ class LS_ImageCompositeGPU:
 
                 msk = torch.stack(out, dim=0)
 
-        # ── Blur mask ─────────────────────────────────────────────────────────
+        # ── Blur mask (separable 1D passes — O(2k) instead of O(k²)) ─────────
         if blur_radius != 0:
             k = max(1, int(blur_radius * 3)) * 2 + 1
             coords = torch.arange(k, dtype=torch.float32, device=device) - k // 2
             g = torch.exp(-0.5 * (coords / max(blur_radius, 1e-6)) ** 2)
-            g = g / g.sum()
-            blur_kernel = (g[:, None] * g[None, :]).view(1, 1, k, k)
-            msk = F.conv2d(msk.unsqueeze(1), blur_kernel, padding=k // 2).squeeze(1).clamp(0, 1)
+            g = (g / g.sum()).view(1, 1, 1, k)
+            b4 = msk.unsqueeze(1)
+            b4 = F.conv2d(b4, g,           padding=(0, k // 2))
+            b4 = F.conv2d(b4, g.transpose(2, 3), padding=(k // 2, 0))
+            msk = b4.squeeze(1).clamp(0, 1)
 
         # ── Resize mask to match layer spatial dims if needed ─────────────────
         if msk.shape[-2] != lH or msk.shape[-1] != lW:
